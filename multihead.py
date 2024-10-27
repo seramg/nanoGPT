@@ -1,4 +1,6 @@
 import torch
+print(torch.version.cuda)
+print(torch.cuda.is_available())
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -11,8 +13,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
 n_head = 6
-n_layer = 6
-dropout = 0.2
+n_layer = 6 # layer of blocks we are going to have
+dropout = 0.2 # for every forward backward pass 20% of all of these intermediate calculations are disabled and dropped to 0.
 
 torch.manual_seed(1337)
 
@@ -81,7 +83,7 @@ class Head(nn.Module):
 
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-
+        # randomly preventing some nodes from communicating
         v = self.value(x)
         out = wei @ v
         return out
@@ -93,9 +95,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd) # projection layer that foes back in the residual pathway
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1) # output of the self attention
+        out = self.proj(out)
+        return out
     
 class FeedForward(nn.Module):
     """a simple linear layer followed by a non linearity"""
@@ -103,8 +109,10 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
-            nn.ReLU()
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd), # projection layer
+            nn.Dropout(dropout) # before the residual connection back right before the connection back into the residual pathway so we can drop out that as the last layer
         )
     
     def forward(self, x): # on a per token level, all of the tokens do this independently so self attention is the communication
@@ -119,14 +127,21 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head): # group size in group convolution
         # the block basically intersperses communication and then computation.
         super().__init__()
-        head_size = n_embd // n_head
+        head_size = n_embd // n_head # n_embd is 32 and head size should be 8 so divided by 4 ie, n_head
         self.sa = MultiHeadAttention(n_head, head_size) # communication is done
         self.ffwd = FeedForward(n_embd) # computation is done
+        self.ln1 = nn.LayerNorm(n_embd) # 32, when normalisation is done the mean and variance are taken over 32 number so the batch and the time act as batch dimensions 
+        self.ln2 = nn.LayerNorm(n_embd)
         
         def forward(self, x):
-            # done independently on all the tokens.
-            x = self.sa(x)
-            x = self.ffwd(x)
+            # # done independently on all the tokens.
+            # x = x + self.sa(x) # we fork off and do some communication nd we come back
+            # x = x + self.ffwd(x) # optimisation, sum just distributes the gradients
+            # # we fork off and do some computation nd we come back
+            
+            x = x + self.sa(self.ln1(x)) # per token transformation that just normalizes the features and makes them a unit mean, unit Gaussian at initialization 
+            c = x + self.ffwd(self.ln2(x))
+            
             return x
 
 class BigramLanguageModel(nn.Module):
@@ -135,15 +150,17 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         # # 4 communication channel
-        # self.sa_head = MultiHeadAttention(4, n_embd//4) # ie, 4 heads of 8 dimensional self attention
-        # self.ffwd = FeedForward(n_embd)
+        self.sa_head = MultiHeadAttention(4, n_embd//4) # ie, 4 heads of 8 dimensional self attention
+        self.ffwd = FeedForward(n_embd)
         
         # sequential application of blocks
         self.blocks = nn.Sequential(
             Block(n_embd, n_head=4), # size n_embd is 32 it must be reduced to 8 for it to be computed with n_head therefore head_size = n_embd // n_head
             Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4)
+            Block(n_embd, n_head=4),
+            nn.LayerNorm(n_embd) # just at the end of the transformer and before the final linear layer
         )
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
